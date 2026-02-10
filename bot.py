@@ -315,25 +315,48 @@ async def process_day_description(message: types.Message):
 
 Пиши серьёзно, без эмодзи, чётко по пунктам. Персонаж ОБЯЗАН следовать этому плану строго, не отклоняясь."""
     
-    plan = await call_ai(PLANNER_MODEL, [{"role": "user", "content": planner_prompt}])
-    
-    if not plan:
-        await status_msg.edit_text("❌ Ошибка планировщика! День не потрачен, попробуй снова.")
-        return
-    
-    # Парсим план на шаги
+    # Максимум 3 попытки сгенерировать план
+    max_attempts = 3
     plan_steps = []
-    for line in plan.strip().split('\n'):
-        match = re.match(r'^\d+\.\s*\[?(\d{1,2}:?\d{0,2})\]?\s*[:.]?\s*(.+)$', line.strip())
-        if match:
-            time_str = match.group(1)
-            action = match.group(2).strip()
-            plan_steps.append({"time": time_str, "action": action})
     
-    if len(plan_steps) < 6:
-        # Если мало шагов, просим ещё раз
-        await status_msg.edit_text("🔄 План слишком короткий, генерируем заново...")
-        await process_day_description(message)
+    for attempt in range(max_attempts):
+        plan = await call_ai(PLANNER_MODEL, [{"role": "user", "content": planner_prompt}])
+        
+        if not plan:
+            if attempt < max_attempts - 1:
+                await status_msg.edit_text(f"🔄 Попытка {attempt + 1}/{max_attempts}... Ошибка, пробуем снова...")
+                await asyncio.sleep(1)
+                continue
+            else:
+                await status_msg.edit_text("❌ Ошибка планировщика после 3 попыток! День не потрачен.")
+                return
+        
+        # Парсим план на шаги
+        plan_steps = []
+        for line in plan.strip().split('\n'):
+            # Ищем строки типа "1. [10:00]: действие" или "1. 10:00: действие" или "1. действие"
+            match = re.match(r'^\d+[\.\)]\s*\[?(\d{1,2}:?\d{0,2})\]?\s*[:.\-]?\s*(.+)$', line.strip())
+            if match:
+                time_str = match.group(1) if match.group(1) else "???"
+                action = match.group(2).strip()
+                if len(action) > 5:  # Фильтруем короткий мусор
+                    plan_steps.append({"time": time_str, "action": action})
+        
+        # Если нашли достаточно шагов — ок
+        if len(plan_steps) >= 6:
+            break
+        else:
+            if attempt < max_attempts - 1:
+                await status_msg.edit_text(f"🔄 План слишком короткий ({len(plan_steps)} шагов), пробуем снова... ({attempt + 1}/{max_attempts})")
+                await asyncio.sleep(1)
+            else:
+                # Последняя попытка — берём что есть или дефолтный план
+                if len(plan_steps) < 3:
+                    await status_msg.edit_text("❌ Не удалось составить план! День не потрачен.")
+                    return
+    
+    if len(plan_steps) < 3:
+        await status_msg.edit_text("❌ План слишком короткий! День не потрачен.")
         return
     
     await status_msg.edit_text(f"✅ План составлен! {len(plan_steps)} действий. Запускаем персонажа...")
@@ -756,7 +779,7 @@ async def end_day(callback: types.CallbackQuery):
     
     user["days_lived"] += 1
     user["history"].append({
-        "day_number": user["days_lived"],
+        "day_number": user["days_lived'],
         "summary": summary,
         "character_name": day_data['state'].name
     })
