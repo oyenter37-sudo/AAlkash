@@ -318,6 +318,7 @@ async def process_day_description(message: types.Message):
     # Максимум 3 попытки сгенерировать план
     max_attempts = 3
     plan_steps = []
+    plan = ""
     
     for attempt in range(max_attempts):
         plan = await call_ai(PLANNER_MODEL, [{"role": "user", "content": planner_prompt}])
@@ -779,7 +780,7 @@ async def end_day(callback: types.CallbackQuery):
     
     user["days_lived"] += 1
     user["history"].append({
-        "day_number": user["days_lived'],
+        "day_number": user["days_lived"],
         "summary": summary,
         "character_name": day_data['state'].name
     })
