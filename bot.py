@@ -7,7 +7,7 @@ import aiohttp
 import random
 from datetime import datetime, timedelta
 from typing import Dict, Optional, List
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
@@ -45,6 +45,8 @@ class CharacterState:
     inventory: List[str]
     location: str
     time: str
+    current_step: int = 0
+    total_steps: int = 0
     
     def to_dict(self):
         return asdict(self)
@@ -266,7 +268,7 @@ async def start_new_day(callback: types.CallbackQuery):
 Пиши что угодно, нейросеть составит план!"""
     )
     
-    active_days[user_id] = {"stage": "waiting_description", "messages": []}
+    active_days[user_id] = {"stage": "waiting_description"}
 
 @dp.message(F.text)
 async def handle_text(message: types.Message):
@@ -281,38 +283,37 @@ async def handle_text(message: types.Message):
         return
     
     if user_id in active_days and active_days[user_id].get("stage") == "simulation":
-        await message.answer("⏳ День идёт... Жми 🔄 Обновить для продолжения!")
+        await message.answer("⏳ День идёт... Жди завершения действия!")
         return
 
 async def process_day_description(message: types.Message):
     user_id = message.from_user.id
     description = message.text
     
-    status_msg = await message.answer("🧠 Нейросеть 1 составляет план дня...")
+    status_msg = await message.answer("🧠 Нейросеть 1 составляет детальный план дня...")
     
     planner_prompt = f"""Ты — планировщик дней для персонажа-алк*ша в игре-симуляторе.
     
 Задача пользователя: "{description}"
 
-Составь ДЕТАЛЬНЫЙ план дня с временными метками (утро/день/вечер/ночь).
+Составь ДЕТАЛЬНЫЙ план дня из МИНИМУМ 10 конкретных действий. Не просто "утро/день/вечер", а конкретные шаги:
+1. Проснуться и осмотреться
+2. Выпить кофе/пива
+3. Пойти туда-то
+4. Сделать то-то
+5. И так далее...
+
+Каждое действие должно быть конкретным с примерным временем.
 Персонаж может материться, совершать преступления, знакомиться, есть, ср*ть — всё что угодно.
-План должен быть конкретным, с примерным временем каждого действия.
 
-Формат:
-Утро (6:00-12:00):
-- [время]: действие
-- [время]: действие
+Формат (строго):
+1. [время]: конкретное действие
+2. [время]: конкретное действие
+3. [время]: конкретное действие
+...
+(минимум 10 пунктов)
 
-День (12:00-18:00):
-- [время]: действие
-
-Вечер (18:00-22:00):
-- [время]: действие
-
-Ночь (22:00-6:00):
-- [время]: действие
-
-Пиши серьёзно, без эмодзи, чётко по пунктам."""
+Пиши серьёзно, без эмодзи, чётко по пунктам. Персонаж ОБЯЗАН следовать этому плану строго, не отклоняясь."""
     
     plan = await call_ai(PLANNER_MODEL, [{"role": "user", "content": planner_prompt}])
     
@@ -320,7 +321,22 @@ async def process_day_description(message: types.Message):
         await status_msg.edit_text("❌ Ошибка планировщика! День не потрачен, попробуй снова.")
         return
     
-    await status_msg.edit_text("✅ План составлен! Запускаем персонажа...")
+    # Парсим план на шаги
+    plan_steps = []
+    for line in plan.strip().split('\n'):
+        match = re.match(r'^\d+\.\s*\[?(\d{1,2}:?\d{0,2})\]?\s*[:.]?\s*(.+)$', line.strip())
+        if match:
+            time_str = match.group(1)
+            action = match.group(2).strip()
+            plan_steps.append({"time": time_str, "action": action})
+    
+    if len(plan_steps) < 6:
+        # Если мало шагов, просим ещё раз
+        await status_msg.edit_text("🔄 План слишком короткий, генерируем заново...")
+        await process_day_description(message)
+        return
+    
+    await status_msg.edit_text(f"✅ План составлен! {len(plan_steps)} действий. Запускаем персонажа...")
     
     user = users_data[user_id]
     char_name = user.get("character_name")
@@ -333,90 +349,76 @@ async def process_day_description(message: types.Message):
     
     state = CharacterState(
         name=char_name,
-        mood="😐 Норм",
-        hunger="🍗 Не голоден",
-        health="❤️ Здоров",
+        mood="Норм",
+        hunger="Не голоден",
+        health="Здоров",
         money=random.randint(100, 1000),
-        drunk="🍺 Трезв",
-        risk="🎲 Средний",
+        drunk="Трезв",
+        risk="Средний",
         inventory=[],
-        location="Дом",
-        time="07:00"
+        location="Неизвестно",
+        time=plan_steps[0]["time"] if plan_steps else "07:00",
+        current_step=0,
+        total_steps=len(plan_steps)
     )
     
     active_days[user_id] = {
         "stage": "simulation",
         "plan": plan,
+        "plan_steps": plan_steps,
         "state": state,
+        "agent_context": "Персонаж только проснулся. Находится дома. Обычное утро, соседи шумят за стенкой.",
         "history": [],
         "message_id": None,
         "chat_id": message.chat.id,
-        "tool_failures": 0,
-        "waiting_for_user": True,
+        "processing": False,
         "day_ended": False
     }
     
     if user["days_limit"] != float('inf'):
         user["days_remaining"] -= 1
     
-    await show_simulation_card(user_id, is_start=True)
+    # Показываем стартовую карточку
+    await show_initial_card(user_id)
 
-async def show_simulation_card(user_id: int, is_start: bool = False):
-    """Показывает карточку симуляции (только при старте или по кнопке)"""
+async def show_initial_card(user_id: int):
+    """Показывает начальную карточку без действий персонажа"""
     day_data = active_days[user_id]
     state = day_data["state"]
+    user = users_data[user_id]
     
-    if is_start:
-        # Первый запуск — персонаж только проснулся
-        display_text = f"Бл*ть, утро... Опять этот д*рьмовый мир. Надо встать и что-то делать, нах*й."
-        agent_text = "🌍 Ты дома. Соседи орят за стенкой, погода за окном — х*й пойми какая. Начинается новый день, бл*ть."
-        
-        day_data["history"].append(f"[{state.time}] {state.name} проснулся дома")
-    else:
-        # Это не должно вызываться без нажатия кнопки
-        return
+    current_action = day_data["plan_steps"][0]["action"] if day_data["plan_steps"] else "Начать день"
     
-    card_text = format_card(state, day_data, display_text, agent_text, False)
+    card_text = f"""🥸 <b>{state.name}</b> — День #{user['days_lived'] + 1}
+
+⏰ {state.time} | 📍 {state.location}
+📋 Шаг {state.current_step + 1}/{state.total_steps}
+
+😡 Настроение: {state.mood}
+🍗 Голод: {state.hunger} | ❤️ Здоровье: {state.health}
+💰 {state.money}₽ | 🍺 {state.drunk} | 🎲 {state.risk}
+🎒 {', '.join(state.inventory) if state.inventory else 'Пусто'}
+
+📋 <b>План дня:</b>
+{day_data['plan'][:800]}...
+
+⏳ <i>Персонаж готовится начать день...</i>
+⏳ <i>Нажми Обновить, чтобы увидеть первое действие</i>"""
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"sim_step_{user_id}")],
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"sim_step_{user_id}_0")],
         [InlineKeyboardButton(text="⏹️ Завершить день", callback_data=f"end_day_{user_id}")]
     ])
     
-    msg = await bot.send_message(
-        day_data["chat_id"], 
-        card_text, 
-        reply_markup=keyboard,
-        parse_mode=ParseMode.HTML
-    )
+    msg = await bot.send_message(day_data["chat_id"], card_text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
     day_data["message_id"] = msg.message_id
-
-def format_card(state, day_data, char_text, agent_text, has_random_event):
-    """Форматирует карточку компактно с HTML"""
-    inventory_str = ", ".join(state.inventory) if state.inventory else "Пусто"
-    
-    # Компактная версия — только важное
-    card = f"""🥸 <b>{state.name}</b> — День #{users_data[list(active_days.keys())[list(active_days.values()).index(day_data)]['days_lived'] + 1 if list(active_days.keys())[list(active_days.values()).index(day_data)] in users_data else 1}
-
-⏰ {state.time} | 📍 {state.location}
-
-😡 {state.mood} | 🍗 {state.hunger} | ❤️ {state.health}
-💰 {state.money}₽ | 🍺 {state.drunk} | 🎲 {state.risk}
-🎒 {inventory_str}
-
-💬 <i>{char_text}</i>
-
-{agent_text}"""
-    
-    if has_random_event:
-        card += "\n\n🔥 <b>СЛУЧАЙНОЕ СОБЫТИЕ!</b>"
-    
-    return card
 
 @dp.callback_query(F.data.startswith("sim_step_"))
 async def simulation_next(callback: types.CallbackQuery):
-    """Следующий шаг симуляции — только по кнопке"""
-    user_id = int(callback.data.split("_")[2])
+    """Следующий шаг симуляции"""
+    parts = callback.data.split("_")
+    user_id = int(parts[2])
+    requested_step = int(parts[3]) if len(parts) > 3 else -1
     
     if user_id not in active_days:
         await callback.answer("День завершён!", show_alert=True)
@@ -428,22 +430,56 @@ async def simulation_next(callback: types.CallbackQuery):
         await callback.answer("День уже завершён!", show_alert=True)
         return
     
-    await callback.answer("🧠 Думаем...")
+    if day_data.get("processing"):
+        await callback.answer("⏳ Персонаж ещё думает... Жди!", show_alert=True)
+        return
     
-    # Запускаем шаг симуляции
+    # Проверяем что шаг правильный
+    if requested_step != day_data["state"].current_step:
+        await callback.answer("❌ Этот шаг уже прошёл!", show_alert=True)
+        return
+    
+    # Блокируем кнопку
+    day_data["processing"] = True
+    await callback.answer("🧠 Персонаж думает...")
+    
+    # Показываем "Жди..." на кнопке
+    await update_button_to_waiting(callback, day_data)
+    
+    # Запускаем шаг
     await run_simulation_step(user_id, callback)
+    
+    day_data["processing"] = False
+
+async def update_button_to_waiting(callback: types.CallbackQuery, day_data: dict):
+    """Меняет кнопку на 'Жди...'"""
+    try:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⏳ Жди...", callback_data="waiting")],
+            [InlineKeyboardButton(text="⏹️ Завершить день", callback_data=f"end_day_{callback.from_user.id}")]
+        ])
+        await callback.message.edit_reply_markup(reply_markup=keyboard)
+    except:
+        pass
 
 async def run_simulation_step(user_id: int, callback: types.CallbackQuery):
     """Один шаг симуляции"""
     day_data = active_days[user_id]
     state = day_data["state"]
     
-    # Формируем промпт для персонажа
-    history_text = "\n".join(day_data["history"][-3:]) if day_data["history"] else "Начало дня."
+    if state.current_step >= len(day_data["plan_steps"]):
+        # День закончился по плану
+        await end_day_by_plan(user_id, callback)
+        return
     
+    current_step_data = day_data["plan_steps"][state.current_step]
+    plan_action = current_step_data["action"]
+    state.time = current_step_data["time"]
+    
+    # 1. Персонаж думает и решает как выполнить план (НЕ видит ответ агента)
     character_prompt = f"""Ты — {state.name}, персонаж-алк*ш в симуляторе жизни.
     
-ТВОЁ СОСТОЯНИЕ:
+ТВОЁ ТЕКУЩЕЕ СОСТОЯНИЕ:
 - Настроение: {state.mood}
 - Голод: {state.hunger}
 - Здоровье: {state.health}
@@ -452,130 +488,237 @@ async def run_simulation_step(user_id: int, callback: types.CallbackQuery):
 - Азарт: {state.risk}
 - Локация: {state.location}
 - Время: {state.time}
+- Инвентарь: {state.inventory}
 
-ПЛАН ДНЯ:
-{day_data['plan']}
+ТВОЯ ЗАДАЧА СЕЙЧАС (строго по плану):
+"{plan_action}"
 
-ЧТО УЖЕ ПРОИЗОШЛО:
-{history_text}
+КОНТЕКСТ ОТ ПРОШЛЫХ СОБЫТИЙ:
+{day_data['agent_context'][:500]}
 
-Ты должен написать КОРОТКО что ты делаешь/думаешь сейчас (2-3 предложения, матерись, эмодзи).
-В конце ОБЯЗАТЕЛЬНО укажи инструмент: [tool:sendagentsimple:твой запрос]
+Ты должен выполнить эту задачу из плана. Напиши КОРОТКО (2-3 предложения) что ты делаешь, как ты это делаешь. Матерись, используй эмодзи. Это твои мысли и действия — их увидит пользователь.
 
-Примеры:
-[tool:sendagentsimple:пойти в магазин]
-[tool:sendagentsimple:ограбить прохожего]"""
+В конце укажи инструмент для агента (только он его увидит): [tool:sendagentsimple:твой запрос к агенту]"""
 
     char_response = await call_ai(CHARACTER_MODEL, [{"role": "user", "content": character_prompt}])
     
     if not char_response:
-        day_data["tool_failures"] += 1
-        if day_data["tool_failures"] >= 2:
-            await callback.message.edit_text("❌ Ошибка персонажа! День прерван, но не потрачен.")
-            del active_days[user_id]
-            return
-        else:
-            await asyncio.sleep(1)
-            await run_simulation_step(user_id, callback)
-            return
+        await handle_ai_error(user_id, callback, "персонаж не отвечает")
+        return
     
-    day_data["tool_failures"] = 0
-    
-    # Проверяем инструмент
+    # Извлекаем инструмент
     tool_match = re.search(r'\[tool:sendagentsimple:(.*?)\]', char_response, re.IGNORECASE)
     
     if not tool_match:
-        day_data["tool_failures"] += 1
-        if day_data["tool_failures"] >= 2:
-            await callback.message.edit_text("❌ Персонаж не хочет действовать! День прерван.")
-            del active_days[user_id]
-            return
-        
-        fix_prompt = character_prompt + "\n\nВАЖНО: Ты забыл добавить [tool:...] в конце! Добавь сейчас!"
+        # Пробуем ещё раз с напоминанием
+        fix_prompt = character_prompt + "\n\nВАЖНО: Ты забыл добавить [tool:sendagentsimple:...] в конце! Это обязательно!"
         char_response = await call_ai(CHARACTER_MODEL, [{"role": "user", "content": fix_prompt}])
         tool_match = re.search(r'\[tool:sendagentsimple:(.*?)\]', char_response, re.IGNORECASE)
         
         if not tool_match:
-            await callback.message.edit_text("❌ Персонаж в ступоре! День прерван.")
-            del active_days[user_id]
+            await handle_ai_error(user_id, callback, "персонаж не хочет использовать инструменты")
             return
     
     tool_text = tool_match.group(1).strip()
-    # Убираем tool из текста для показа
     display_text = re.sub(r'\[tool:sendagentsimple:.*?\]', '', char_response, flags=re.IGNORECASE).strip()
     
-    # Обновляем историю
-    day_data["history"].append(f"[{state.time}] {display_text[:80]}...")
-    
-    # Запрос к агенту окружения
+    # 2. Агент обрабатывает (пользователь этого НЕ видит!)
     # Шанс случайного события — 10%
     random_event = random.random() < 0.10
     
-    agent_prompt = f"""Ты — агент окружения в симуляторе жизни.
+    agent_prompt = f"""Ты — агент окружения в симуляторе жизни. Пользователь НЕ видит твой ответ — только персонаж.
 
 ПЕРСОНАЖ: {state.name}
-ЕГО ДЕЙСТВИЕ: {tool_text}
+ЕГО ЗАПРОС (через инструмент): {tool_text}
 ТЕКУЩЕЕ ВРЕМЯ: {state.time}
-ЛОКАЦИЯ: {state.location}
+ТЕКУЩАЯ ЛОКАЦИЯ: {state.location}
 
-ПЛАН ДНЯ (для контекста):
-{day_data['plan'][:500]}
+ЗАДАЧА ИЗ ПЛАНА: {plan_action}
 
-ЗАДАЧА: Опиши КОРОТКО (1-2 предложения) что происходит вокруг. Используй эмодзи.
+ПРЕДЫДУЩИЙ КОНТЕКСТ:
+{day_data['agent_context'][:300]}
 
-{'ВАЖНО: Случилось РАНДОМНОЕ СОБЫТИЕ (10% шанс)! Опиши что-то неожиданное!' if random_event else ''}"""
+{'ВАЖНО: Случилось РАНДОМНОЕ СОБЫТИЕ (10% шанс)! Опиши что-то неожиданное, что меняет ситуацию!' if random_event else ''}
+
+Твоя задача:
+1. Опиши что происходит вокруг (локация, люди, обстановка)
+2. Опиши результат действия персонажа (успех/неудача)
+3. Обнови локацию если нужно (любая, не шаблонная)
+4. Обнови состояние персонажа если логично (ранение, находка денег, etc.)
+
+Пиши подробно, это внутренняя логика игры. Персонаж потом увидит результат и отреагирует."""
 
     agent_response = await call_ai(AGENT_MODEL, [{"role": "user", "content": agent_prompt}])
     
     if not agent_response:
-        agent_response = "🌍 Окружение без изменений..."
+        agent_response = "Окружение без изменений. Действие выполнено."
     
-    # Обновляем состояние
-    current_hour = int(state.time.split(":")[0])
-    new_hour = (current_hour + random.randint(1, 3)) % 24
-    state.time = f"{new_hour:02d}:00"
+    # Обновляем контекст для следующих шагов (персонаж будет знать, но юзер нет)
+    day_data["agent_context"] = agent_response
+    
+    # Обновляем состояние персонажа на основе ответа агента
+    update_state_from_agent(state, agent_response, tool_text)
+    
+    # Сохраняем в историю
+    day_data["history"].append({
+        "step": state.current_step,
+        "time": state.time,
+        "action": plan_action,
+        "char_thoughts": display_text,
+        "agent_result": agent_response  # Юзер этого не видит!
+    })
+    
+    # 3. Показываем пользователю только мысли персонажа и его состояние
+    await show_step_result(user_id, callback, display_text, random_event)
+    
+    # Переходим к следующему шагу
+    state.current_step += 1
+
+def update_state_from_agent(state: CharacterState, agent_text: str, tool_text: str):
+    """Обновляет состояние на основе ответа агента"""
+    # Обновляем локацию если агент упомянул
+    location_indicators = ["ты в", "ты находишься в", "локация:", "место:"]
+    for indicator in location_indicators:
+        if indicator in agent_text.lower():
+            # Пытаемся извлечь локацию
+            parts = agent_text.lower().split(indicator)
+            if len(parts) > 1:
+                possible_loc = parts[1].split('.')[0].split(',')[0].strip()
+                if len(possible_loc) > 2:
+                    state.location = possible_loc[:50]
+                    break
+    
+    # Если локация не определена, берём из инструмента
+    if state.location == "Неизвестно" or not state.location:
+        if "дом" in tool_text.lower():
+            state.location = "Дом"
+        elif "улиц" in tool_text.lower():
+            state.location = "Улица"
+        elif "магазин" in tool_text.lower():
+            state.location = "Магазин"
+        elif "банк" in tool_text.lower():
+            state.location = "Банк"
+        elif "бар" in tool_text.lower():
+            state.location = "Бар"
+        elif "тюрьм" in tool_text.lower():
+            state.location = "Тюрьма"
+        else:
+            state.location = "Неизвестная локация"
     
     # Случайные изменения параметров
+    if "ранен" in agent_text.lower() or "поранил" in agent_text.lower():
+        state.health = "Ранен"
+    if "деньги" in agent_text.lower() or "нашёл" in agent_text.lower() or "украл" in agent_text.lower():
+        # Парсим сумму если есть
+        import re
+        money_match = re.search(r'(\d+)\s*(руб|₽)', agent_text.lower())
+        if money_match:
+            state.money += int(money_match.group(1))
+    
+    # Обновляем голод и пьянство случайно
     if random.random() < 0.3:
-        state.hunger = random.choice(["😐 Норм", "😠 Хочу жрать", "🤢 Сыт"])
+        state.hunger = random.choice(["Сыт", "Норм", "Хочу жрать"])
     if random.random() < 0.2:
-        state.drunk = random.choice(["😐 Трезв", "😏 Лёгкий б*харик", "🤪 П*ян"])
+        state.drunk = random.choice(["Трезв", "Лёгкий б*харик", "П*ян"])
+
+async def show_step_result(user_id: int, callback: types.CallbackQuery, char_text: str, has_random_event: bool):
+    """Показывает результат шага пользователю (только персонаж, без агента)"""
+    day_data = active_days[user_id]
+    state = day_data["state"]
+    user = users_data[user_id]
     
-    # Обновляем локацию
-    location_keywords = {
-        "магазин": "Магазин",
-        "банк": "Банк",
-        "дом": "Дом",
-        "улиц": "Улица",
-        "бар": "Бар",
-        "тюрьм": "Тюрьма",
-        "полиц": "Полиция",
-        "работ": "Работа",
-        "парк": "Парк"
-    }
-    for keyword, loc in location_keywords.items():
-        if keyword in tool_text.lower():
-            state.location = loc
-            break
+    # Следующий шаг для кнопки
+    next_step = state.current_step + 1
     
-    # Формируем карточку
-    card_text = format_card(state, day_data, display_text, agent_response, random_event)
+    # Проверяем конец дня
+    if state.current_step >= len(day_data["plan_steps"]) - 1:
+        is_last = True
+        next_button_text = "🏁 Завершить день"
+    else:
+        is_last = False
+        next_button_text = "🔄 Следующий шаг"
+    
+    event_text = "\n\n🔥 <b>СЛУЧАЙНОЕ СОБЫТИЕ!</b>" if has_random_event else ""
+    
+    card_text = f"""🥸 <b>{state.name}</b> — День #{user['days_lived'] + 1}
+
+⏰ {state.time} | 📍 {state.location}
+📋 Шаг {state.current_step + 1}/{state.total_steps}
+
+😡 {state.mood} | 🍗 {state.hunger} | ❤️ {state.health}
+💰 {state.money}₽ | 🍺 {state.drunk} | 🎲 {state.risk}
+🎒 {', '.join(state.inventory) if state.inventory else 'Пусто'}
+
+💬 <i>{char_text}</i>{event_text}
+
+{'<i>День завершён по плану!</i>' if is_last else '<i>Нажми для продолжения...</i>'}"""
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data=f"sim_step_{user_id}")],
-        [InlineKeyboardButton(text="⏹️ Завершить день", callback_data=f"end_day_{user_id}")]
+        [InlineKeyboardButton(text=next_button_text, callback_data=f"sim_step_{user_id}_{next_step}")],
+        [InlineKeyboardButton(text="⏹️ Завершить день досрочно", callback_data=f"end_day_{user_id}")]
     ])
     
     try:
         await callback.message.edit_text(card_text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
     except Exception as e:
-        # Если не удалось отредактировать — отправляем новое
         msg = await bot.send_message(day_data["chat_id"], card_text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
         day_data["message_id"] = msg.message_id
 
+async def handle_ai_error(user_id: int, callback: types.CallbackQuery, error_text: str):
+    """Обработка ошибки AI"""
+    day_data = active_days[user_id]
+    day_data["processing"] = False
+    
+    await callback.message.edit_text(
+        f"""❌ Ошибка: {error_text}
+
+День прерван, но не потрачен. Начни заново!"""
+    )
+    del active_days[user_id]
+
+async def end_day_by_plan(user_id: int, callback: types.CallbackQuery):
+    """Завершение дня по плану (все шаги выполнены)"""
+    day_data = active_days[user_id]
+    user = users_data[user_id]
+    
+    await callback.answer("📝 День завершён по плану! Создаём саммари...")
+    
+    # Генерируем саммари
+    history_text = "\n".join([f"Шаг {h['step']}: {h['char_thoughts'][:100]}" for h in day_data["history"]])
+    
+    summary_prompt = f"""Составь краткое саммари дня для персонажа {day_data['state'].name}:
+
+ИСТОРИЯ ДНЯ:
+{history_text}
+
+Напиши серьёзное саммари в 3-5 предложений, что произошло за день. Без матов."""
+
+    summary = await call_ai(PLANNER_MODEL, [{"role": "user", "content": summary_prompt}])
+    
+    if not summary:
+        summary = "День прошёл событийно, но детали утеряны..."
+    
+    user["days_lived"] += 1
+    user["history"].append({
+        "day_number": user["days_lived"],
+        "summary": summary,
+        "character_name": day_data['state'].name
+    })
+    
+    del active_days[user_id]
+    
+    await callback.message.edit_text(
+        f"""✅ День #{user['days_lived']} завершён по плану!
+
+📖 Саммари:
+{summary}
+
+Можешь начать новый день!"""
+    )
+
 @dp.callback_query(F.data.startswith("end_day_"))
 async def end_day(callback: types.CallbackQuery):
-    """Завершение дня"""
+    """Досрочное завершение дня"""
     user_id = int(callback.data.split("_")[2])
     
     if user_id not in active_days:
@@ -583,6 +726,10 @@ async def end_day(callback: types.CallbackQuery):
         return
     
     day_data = active_days[user_id]
+    
+    if day_data.get("processing"):
+        await callback.answer("⏳ Дождись окончания текущего действия!", show_alert=True)
+        return
     
     if day_data.get("day_ended"):
         await callback.answer("День уже завершается!", show_alert=True)
@@ -593,39 +740,36 @@ async def end_day(callback: types.CallbackQuery):
     
     await callback.answer("📝 Создаём саммари...")
     
-    # Генерируем саммари
-    history_text = "\n".join(day_data["history"])
+    history_text = "\n".join([f"Шаг {h['step']}: {h['char_thoughts'][:100]}" for h in day_data["history"]])
     
-    summary_prompt = f"""Составь краткое саммари дня для персонажа {day_data['state'].name}:
+    summary_prompt = f"""Составь краткое саммари дня для персонажа {day_data['state'].name} (завершён досрочно):
 
 ИСТОРИЯ ДНЯ:
 {history_text}
 
-Напиши серьёзное саммари в 3-5 предложений, что произошло за день. Без матов, для истории."""
+Напиши серьёзное саммари в 3-5 предложений, что произошло. Без матов."""
 
     summary = await call_ai(PLANNER_MODEL, [{"role": "user", "content": summary_prompt}])
     
     if not summary:
-        summary = "День прошёл событийно, но детали утеряны в алкогольном тумане..."
+        summary = "День закончился раньше времени..."
     
-    # Сохраняем в историю
     user["days_lived"] += 1
     user["history"].append({
         "day_number": user["days_lived"],
         "summary": summary,
-        "character_name": day_data["state"].name
+        "character_name": day_data['state'].name
     })
     
-    # Очищаем активный день
     del active_days[user_id]
     
     await callback.message.edit_text(
-        f"""✅ День #{user['days_lived']} завершён!
+        f"""✅ День #{user['days_lived']} завершён досрочно!
 
 📖 Саммари:
 {summary}
 
-Можешь начать новый день в меню "Скачать ОЛО"!"""
+Можешь начать новый день!"""
     )
 
 @dp.message(Command("history"))
